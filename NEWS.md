@@ -1,4 +1,17 @@
-# tmpinv 0.3.0
+# rtmpinv 1.0.0
+
+## Changes in CLSP
+* Synchronized the package with `rclsp` 1.0.0.
+* Added support for the `cond_tolerance` argument, passed through to the
+  underlying CLSP solver.
+
+## Bug fixes
+* Improved row-wise matrix vectorization and reconstruction to match NumPy
+  row-major behavior where required.
+* Improved handling of bound-constrained iterative refinement.
+* Added support for upper and lower bounds in reduced models.
+
+# rtmpinv 0.3.0
 
 ## Bug fixes
 * Updated CVXR integration for CVXR 1.8.x compatibility.

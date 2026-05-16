@@ -70,6 +70,11 @@
 #' @param alpha numeric scalar, numeric vector, or \code{NULL},
 #'   Regularization parameter for the second step of the CLSP estimator.
 #'
+#' @param cond_tolerance numeric scalar or \code{NULL}, default = \code{NULL}
+#'   Singular-value cutoff for the custom condition number function.
+#'   If \code{NULL}, the implementation uses an internal relative cutoff of
+#'   1e-14.
+#'
 #' @param ... Additional arguments passed to the \pkg{rclsp} solver.
 #'
 #' @return
@@ -241,89 +246,90 @@ tmpinv <- function(S=NULL, M=NULL, b_row=NULL, b_col=NULL, b_val=NULL,
                    i=1L, j=1L, zero_diagonal=FALSE, reduced=NULL,
                    symmetric=FALSE, bounds=NULL, replace_value=NA_real_,
                    tolerance=sqrt(.Machine$double.eps), iteration_limit=50L,
-                   r=1L, final=TRUE, alpha=NULL, ...) {
+                   r=1L, final=TRUE, alpha=NULL, cond_tolerance=NULL, ...) {
   dots     <- list(...)
-  # (n_cells) Perform initial estimation and get cell count
-  result   <- do.call(.tmpinv.instance,
-                      c(list(b_row=b_row, b_col=b_col, b_val=b_val, i=i, j=j,
-                             S=S, M=M, zero_diagonal=zero_diagonal,
-                             reduced=reduced, symmetric=symmetric,
-                             tolerance=tolerance,
-                             iteration_limit=iteration_limit, r=r, final=final,
-                             alpha=alpha),
-                        dots))
-  n_cells  <- nrow(result$x) * ncol(result$x)
-  if        (is.null(bounds))      {
+  
+  # (n_cells) Get cell count from arguments
+  if (is.null(b_row) || is.null(b_col))
+    stop("Both b_row and b_col must be provided.")
+  if (length(b_row) < 2L || length(b_col) < 2L)
+    stop("Minimum length for b_row and b_col is 2.")
+  n_cells <- length(b_row) * as.integer(i) *
+    length(b_col) * as.integer(j)
+  if (is.null(bounds))
     bounds <- list(c(NA_real_, NA_real_))
-  } else if (is.numeric(bounds) && length(bounds) == 2L)
-    bounds <- list(bounds)
-  if                              (length(bounds) == 1L) {
-    bounds <- rep(bounds, n_cells)                     # replicate (low, high)
-  } else if (length(bounds) !=   n_cells)
-    stop(sprintf("Bounds length %d does not match number of variables %d.",
-                 length(bounds), n_cells))
-  bounds   <- lapply(bounds, function(v)   {
-    if (length(v) != 2L)     stop("Each bounds element must have length 2.")
-    vapply(v, function(x)    if (is.null(x) || is.na(x) || length(x) != 1L )
-      NA_real_                 else           as.numeric(x), numeric(1L))
-  })
-  if (all(vapply(bounds,     function(v)    all(is.na(v)), logical(1L))))
-    return(result)                                     # finish if unbounded
+  if (is.numeric(bounds) && length(bounds) == 2L)
+    bounds <- rep(list(bounds), n_cells)               # replicate (low, high)
+  else if (is.list(bounds)) {                          # normalize bounds
+    if (length(bounds) > 1L && length(bounds) != n_cells)
+      stop(sprintf("Bounds length %d does not match number of variables %d.",
+                   length(bounds), n_cells))
+    else if (length(bounds) == 1L)
+      bounds <- rep(bounds, n_cells)                   # replicate (low, high)
+  }
   
   # (result) Perform bound-constrained iterative refinement
-  b_lim      <- matrix(rbind(vapply(bounds, function(v)  if (is.na(v[2]))  Inf
-                                    else                           v[2],
-                                    numeric(1L)),
-                             vapply(bounds, function(v)  if (is.na(v[1])) -Inf
-                                    else                           v[1],
-                                    numeric(1L))),          ncol=     1L)
-  C_lim      <- matrix(rbind(diag(n_cells), diag(n_cells)), ncol=n_cells)
-  S          <- if (!is.null(S)) S  else    matrix(0,  nrow=length(b_row) +
-                                                     length(b_col),
-                                                   ncol=0L)
-  S          <- rbind(cbind(S, matrix(0, nrow=nrow(S), ncol=      2 * n_cells)),
-                      cbind(   matrix(0, nrow=n_cells, ncol=          ncol(S)),
-                               diag(n_cells),
-                               matrix(0, nrow=n_cells, ncol=          n_cells)),
-                      -cbind(  matrix(0, nrow=n_cells, ncol=ncol(S) + n_cells),
-                               diag(n_cells)))
-  finite_rows   <- is.finite(b_lim[, 1L])              # drop rows with +-np.inf
-  nonzero_cols  <- colSums(abs(S[c(rep(TRUE, nrow(S) - length(finite_rows)),
-                                   finite_rows), ,
-                                 drop=FALSE]))   > 0   # reduce S width
-  for   (iter in seq_len(iteration_limit)) {
-    M_idx  <- integer(0)
-    b_val  <- numeric(0)
-    x      <- matrix(result$x, ncol=1L)
-    for (k in seq_len(n_cells)) {
-      if ((!is.na(bounds[[k]][1]) && x[k] < bounds[[k]][1] - tolerance) ||
-          (!is.na(bounds[[k]][2]) && x[k] > bounds[[k]][2] + tolerance)) {
-        next                                           # skip out-of-bounds
+  dots  <- dots[setdiff(names(dots), c("b_lim", "b_val", "C_lim", "S", "M"))]
+  dots$bounds <-  bounds
+  upper <- vapply(bounds, function(v) if (is.na(v[2])) Inf else v[2],
+                  numeric(1L))
+  lower <- vapply(bounds, function(v) if (is.na(v[1])) -Inf else v[1],
+                  numeric(1L))
+  b_lim <- matrix(c(upper, lower), ncol=1L)
+  C_lim <- rbind(diag(n_cells), diag(n_cells))
+  S     <- if (!is.null(S)) as.matrix(S)               else
+    matrix(0, nrow=length(b_row)+length(b_col), ncol=0L)
+  S     <- rbind(
+    cbind(S, matrix(0, nrow=nrow(S), ncol=2L*n_cells)),
+    cbind(   matrix(0, nrow=n_cells, ncol=ncol(S)),         diag(n_cells),
+             matrix(0, nrow=n_cells, ncol=n_cells)),
+    -cbind(   matrix(0, nrow=n_cells, ncol=ncol(S)+n_cells), diag(n_cells))
+  )
+  finite_rows  <- is.finite(b_lim[, 1L])               # drop rows with ±np.inf
+  keep_rows    <- c(rep(TRUE, nrow(S) - nrow(b_lim)), finite_rows)
+  nonzero_cols <- colSums(abs(S[keep_rows, ,
+                                drop=FALSE])) > 0      # reduce S width
+  M0     <- M
+  b_val0 <- b_val
+  result <- NULL
+  for (iter in seq_len(as.integer(iteration_limit))) {
+    if (iter > 1L && sum(finite_rows) > 0L) {
+      M_idx <- integer(0L)
+      b_val <- numeric(0L)
+      x <- matrix(as.vector(t(result$x)), ncol=1L)
+      for (k in seq_len(n_cells)) {
+        v <- as.numeric(x[k])
+        if ((!is.na(bounds[[k]][1]) && v < bounds[[k]][1] - tolerance) ||
+            (!is.na(bounds[[k]][2]) && v > bounds[[k]][2] + tolerance))
+          next
+        M_idx <- c(M_idx, k)
+        b_val <- c(b_val, v)
       }
-      M_idx  <- c(M_idx, k)
-      b_val  <- c(b_val, x[k])
-    }
-    if (length(M_idx) < n_cells) {
-      M      <- diag(n_cells)[M_idx, , drop=FALSE]
-      result <- suppressWarnings(do.call(.tmpinv.instance,
-                                         c(list(b_row=b_row, b_col=b_col,  b_val=b_val,
-                                                b_lim=b_lim[finite_rows, , drop=FALSE], i=i, j=j,
-                                                C_lim=C_lim[finite_rows, , drop=FALSE],
-                                                S=S[c(rep(TRUE, nrow(S) -  nrow(b_lim)),
-                                                      finite_rows),        nonzero_cols,
-                                                    drop=FALSE],           M=M,
-                                                zero_diagonal=zero_diagonal, reduced=reduced,
-                                                symmetric=symmetric, tolerance=tolerance,
-                                                iteration_limit=iteration_limit, r=r,
-                                                final=final, alpha=alpha),
-                                           dots)))
+      if (length(M_idx) < n_cells)
+        M <- diag(n_cells)[M_idx, , drop=FALSE]
+      else
+        break
     } else {
-      break
+      M     <- M0
+      b_val <- b_val0
     }
+    result <- suppressWarnings(do.call(
+      .tmpinv.instance, c(list(b_row=b_row, b_col=b_col,
+                               b_lim=b_lim[finite_rows, ,   drop=FALSE],
+                               b_val=b_val,
+                               C_lim=C_lim[finite_rows, ,   drop=FALSE],
+                               S=S[keep_rows, nonzero_cols, drop=FALSE],
+                               M=M, i=i, j=j, zero_diagonal=zero_diagonal,
+                               reduced=reduced, symmetric=symmetric,
+                               tolerance=tolerance,
+                               iteration_limit=iteration_limit, r=r,
+                               final=final, alpha=alpha,
+                               cond_tolerance=cond_tolerance),
+                          dots)))
   }
   
   # (result) Replace out-of-bound values with replace_value
-  x        <- matrix(result$x, ncol=1L)
+  x        <- matrix(as.vector(t(result$x)), ncol=1L)
   x_lb     <- vapply(bounds, function(v) if (is.na(v[1])) -Inf
                      else                          v[1], numeric(1L))
   x_ub     <- vapply(bounds, function(v) if (is.na(v[2]))  Inf
@@ -373,7 +379,7 @@ print.summary.tmpinv <- function(x, ...) {
 ################################################################################
 .tmpinv.instance <- function(S=NULL, M=NULL, b_row=NULL, b_col=NULL, b_val=NULL,
                              i=1L, j=1L, zero_diagonal=FALSE, reduced=NULL,
-                             symmetric=FALSE, ...) {
+                             symmetric=FALSE, cond_tolerance=NULL, ...) {
   dots  <- list(...)
   # (m), (p) Process the parameters, assert conformity, and get dimensions
   if (is.null(b_row)         || is.null(b_col)        )
@@ -424,9 +430,11 @@ print.summary.tmpinv <- function(x, ...) {
     b            <- matrix(b_blocks,      ncol=1L)
     result$model <- do.call(rclsp::clsp, c(list(problem="ap", b=b, C=dots$C_lim,
                                                 S=S, M=M, m=m, p=p, i=i, j=j,
-                                                zero_diagonal=zero_diagonal),
+                                                zero_diagonal=zero_diagonal,
+                                                cond_tolerance=cond_tolerance),
                                            dots[setdiff(names(dots),
-                                                        c("C_lim", "b_lim"))]))
+                                                        c("C_lim", "b_lim",
+                                                          "bounds"))]))
     result$x     <- result$model$x
     
     # perform reduced estimation and return the result
@@ -471,26 +479,16 @@ print.summary.tmpinv <- function(x, ...) {
         X_true[r, c] <- b_val[idx]
       }
     }
-    if (!is.null(dots$b_lim))  {
-      X_lim    <- matrix(NA_real_,     nrow=2L*m, ncol=p)
-      l_idx    <- if (nrow(pos<-which(
-        S[(nrow(S)-nrow(dots$b_lim)+1L):nrow(S), ] == -1,
-        arr.ind=TRUE)) > 0) pos[1,1] else nrow(dots$b_lim)
-      if (l_idx > 1L               ) {
-        for (idx in 1:(l_idx - 1L        )) {
-          col  <- which.max(dots$C_lim[idx, ])
-          r    <- floor((col - 1L) /  p) + 1L
-          c    <-      ((col - 1L) %% p) + 1L
-          X_lim[  r, c] <-  dots$b_lim[idx  ]
-        }
-      }
-      if (l_idx <= nrow(dots$b_lim)) {
-        for (idx in l_idx:nrow(dots$C_lim)) {
-          col  <- which.max(dots$C_lim[idx, ])
-          r    <- floor((col - 1L) /  p) + 1L
-          c    <-      ((col - 1L) %% p) + 1L
-          X_lim[m+r, c] <-  dots$b_lim[idx  ]
-        }
+    if (!is.null(dots$bounds)) {
+      X_lim <- matrix(NA_real_, nrow=2L*m, ncol=p)
+      for (flat_idx in seq_along(dots$bounds)) {
+        v <- dots$bounds[[flat_idx]]
+        r <- (flat_idx - 1L) %/% p + 1L
+        c <- (flat_idx - 1L) %%  p + 1L
+        if (!is.na(v[2]))                              # upper bounds
+          X_lim[  r, c] <- as.numeric(v[2])
+        if (!is.na(v[1]))                              # lower bounds
+          X_lim[m+r, c] <- as.numeric(v[1])
       }
     }
     if (!is.null(S) && any(S[1:(if (is.null(dots$b_lim)) nrow(S) else nrow(S)-
@@ -508,15 +506,7 @@ print.summary.tmpinv <- function(x, ...) {
         b_subset <- matrix(c(b_row[m_start:m_end],
                              b_col[p_start:p_end]),                  ncol=1L)
         M_subset <-  NULL
-        if (!is.null(M))      {
-          subset     <- matrix(X_true[m_start:m_end, p_start:p_end], ncol=1L)
-          non_empty  <- !is.na(subset) & is.finite(subset)
-          if (any(non_empty)) {
-            M_subset <- diag(length(subset))[non_empty, , drop=FALSE]
-            b_subset <- matrix(c(b_subset, subset[non_empty]),       ncol=1L)
-          }
-        }
-        if (!is.null(dots$b_lim))  {
+        if (!is.null(dots$bounds)) {
           subset     <- as.vector(t(rbind(
             X_lim[(m_start  ):(m_end  ), p_start:p_end],
             X_lim[(m+m_start):(m+m_end), p_start:p_end]
@@ -530,12 +520,22 @@ print.summary.tmpinv <- function(x, ...) {
                                     matrix(0, nrow=h, ncol=h))[non_empty, ,
                                                                drop=FALSE],
                               rbind(matrix(0, nrow=h, ncol=h),
-                                    -diag(h)                  )[non_empty, ,
-                                                                drop=FALSE])
+                                    -diag(h)                 )[non_empty, ,
+                                                               drop=FALSE])
             S_subset <- rbind(cbind(S_subset, matrix(0, nrow=nrow(S_subset),
                                                      ncol=ncol(S) )),
                               cbind(matrix(0, nrow=nrow(S),
                                            ncol=ncol(S_subset)), S))
+            S_subset <- S_subset[, colSums(abs(S_subset)) > 0, drop=FALSE]
+          }
+        }
+        if (!is.null(M)) {
+          subset <- matrix(as.vector(t(X_true[m_start:m_end, p_start:p_end])),
+                           ncol=1L)
+          non_empty  <- !is.na(subset) & is.finite(subset)
+          if (any(non_empty)) {
+            b_subset <- matrix(c(b_subset, subset[non_empty]), ncol=1L)
+            M_subset <- diag(length(subset))[non_empty, ,      drop=FALSE]
           }
         }
         tmp      <-  do.call(rclsp::clsp, c(list(problem="ap", b=b_subset,
@@ -543,9 +543,11 @@ print.summary.tmpinv <- function(x, ...) {
                                                  M=M_subset,
                                                  m=m_end - m_start + 1L,
                                                  p=p_end - p_start + 1L,
-                                                 i=i, j=j, zero_diagonal=FALSE),
+                                                 i=i, j=j, zero_diagonal=FALSE,
+                                                 cond_tolerance=cond_tolerance),
                                             dots[setdiff(names(dots),
-                                                         c("C_lim", "b_lim"))]))
+                                                         c("C_lim", "b_lim",
+                                                           "bounds"))]))
         result$model[[length(result$model) + 1L]] <-  tmp
         result$x[m_start:m_end, p_start:p_end]    <-  tmp$x
       }

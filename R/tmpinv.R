@@ -437,7 +437,7 @@ print.summary.tmpinv <- function(x, ...) {
                                                           "bounds"))]))
     result$x     <- result$model$x
     
-    # perform reduced estimation and return the result
+  # perform reduced estimation and return the result
   } else {
     reduced      <- as.integer(reduced)
     if (length(reduced)  != 2L                                               ||
